@@ -39,6 +39,8 @@ hooks = Hooks()
 async def _record_request(ctx, request_context):
     """
     每次发起 model 调用之前，创建一条 ApiCall 记录。
+    在每次调模型前记录模型名、这次发了几条消息、带了哪些工具、
+    最后一个 part 是什么（也就是输出里 last_message 那行）。
     """
     msgs = list(request_context.messages)
     last_part = msgs[-1].parts[-1] if msgs and msgs[-1].parts else None
@@ -59,6 +61,7 @@ async def _record_request(ctx, request_context):
 async def _record_response(ctx, request_context, response):
     """
     每次 model 调用返回后，填充上面这条 ApiCall 的 response 字段。
+    在模型返回后记录结束原因和 token 用量
     """
     if api_call_log:
         call = api_call_log[-1]

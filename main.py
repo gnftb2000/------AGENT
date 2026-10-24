@@ -1,12 +1,16 @@
+import asyncio
+
 from prompt_toolkit import PromptSession
+from pydantic_ai import Agent
+from pydantic_graph import End
 
 from agent import agent, MODEL_NAME, api_call_log
 from ui.commands import (
     COMMANDS,
     SessionState,
     console,
-    print_agent_steps,
     print_divider,
+    print_part,
     print_welcome_banner,
 )
 
@@ -47,15 +51,38 @@ def handle_command(user_input, state):
 
 def apply_result(state, result):
     """
-    跑完一轮 Agent 后，把结果同步到 SessionState 并显示新增的中间过程。
+    跑完一轮 Agent 后，把结果同步到 SessionState。
     """
     state.history = result.all_messages()
-    usage = result.usage()
+    usage = result.usage
     state.input_tokens += usage.input_tokens
     state.output_tokens += usage.output_tokens
     state.last_api_calls = list(api_call_log)
-    # result.new_messages() 直接拿到这一轮新增的 message，不需要手动算偏移
-    print_agent_steps(result.new_messages())
+
+
+async def run_agent_loop(user_input, state):
+    """
+    展开 agent.run_sync()，逐节点驱动 Agent 循环，每步实时打印。
+    """
+    api_call_log.clear()
+
+    async with agent.iter(user_input, message_history=state.history) as run:
+        node = run.next_node
+
+        while not isinstance(node, End):
+            node = await run.next(node)
+
+            if Agent.is_call_tools_node(node):
+                for part in node.model_response.parts:
+                    print_part(part)
+
+            elif Agent.is_model_request_node(node):
+                for part in node.request.parts:
+                    if part.part_kind == "tool-return":
+                        print_part(part)
+
+    apply_result(state, run.result)
+    console.print()
 
 
 def main():
@@ -77,10 +104,8 @@ def main():
         if action == "continue":
             continue
 
-        # 核心 Agent 循环：清空收集 buffer，跑一轮，把结果应用到 state
-        api_call_log.clear()
-        result = agent.run_sync(user_input, message_history=state.history)
-        apply_result(state, result)
+        # 核心 Agent 循环：自己驱动节点流转，实时打印每一步
+        asyncio.run(run_agent_loop(user_input, state))
 
 
 if __name__ == "__main__":

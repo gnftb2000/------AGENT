@@ -4,6 +4,7 @@ from prompt_toolkit import PromptSession
 from pydantic_ai import Agent
 from pydantic_graph import End
 
+import session
 from agent import agent, MODEL_NAME, api_call_log
 from ui.commands import (
     COMMANDS,
@@ -58,7 +59,8 @@ def apply_result(state, result):
     state.input_tokens += usage.input_tokens
     state.output_tokens += usage.output_tokens
     state.last_api_calls = list(api_call_log)
-
+    # 把本轮新增的消息追加到会话文件
+    session.append_messages(state.session_id, result.new_messages())
 
 async def run_agent_loop(user_input, state):
     """
@@ -78,7 +80,7 @@ async def run_agent_loop(user_input, state):
 
             elif Agent.is_model_request_node(node):
                 for part in node.request.parts:
-                    if part.part_kind == "tool-return":
+                    if part.part_kind in ("tool-return", "retry-prompt"):
                         print_part(part)
 
     apply_result(state, run.result)
@@ -86,9 +88,11 @@ async def run_agent_loop(user_input, state):
 
 
 def main():
-    state = SessionState(model_name=MODEL_NAME)
-    print_welcome_banner("Coding Agent")
-
+    state = SessionState(
+        model_name=MODEL_NAME,
+        session_id=session.new_session_id(),
+    )
+    print_welcome_banner("my-code-agent")
     while True:
         # 读用户输入
         user_input = read_user_input()
@@ -105,7 +109,12 @@ def main():
             continue
 
         # 核心 Agent 循环：自己驱动节点流转，实时打印每一步
-        asyncio.run(run_agent_loop(user_input, state))
+        try:
+            asyncio.run(run_agent_loop(user_input, state))
+        except KeyboardInterrupt:
+            console.print("\n[bold yellow]已中断[/]\n")
+        except Exception as e:
+            console.print(f"\n[bold red]✗ {type(e).__name__}: {e}[/]\n")
 
 
 if __name__ == "__main__":

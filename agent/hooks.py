@@ -4,10 +4,14 @@
 主循环在每轮 run_sync 之前清空 api_call_log，跑完后快照到 SessionState 里，
 /api-detail 命令再把这一轮的所有调用展示给用户。
 """
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic_ai.capabilities import Hooks
+from pydantic_ai.exceptions import ModelHTTPError, ModelAPIError
+
+from ui.render import console
 
 
 @dataclass
@@ -34,6 +38,7 @@ api_call_log: list[ApiCall] = []
 
 hooks = Hooks()
 
+# ---------- API 调用记录 ----------
 
 @hooks.on.before_model_request
 async def _record_request(ctx, request_context):
@@ -70,3 +75,47 @@ async def _record_response(ctx, request_context, response):
         call.input_tokens = response.usage.input_tokens
         call.output_tokens = response.usage.output_tokens
     return response
+
+MAX_RETRIES = 3
+
+@hooks.on.model_request
+async def _retry_on_error(ctx, *, request_context, handler):
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return await handler(request_context)
+        except ModelHTTPError as e:
+            # http 错误，根据错误码进行判断
+
+            if e.status_code < 500:
+                # 4xx 的错误，不重试直接报错
+                raise
+            if attempt >= MAX_RETRIES:
+                console.print(f"[bold red]✗ HTTP {e.status_code}，重试 {MAX_RETRIES} 次后仍失败[/]")
+                raise
+
+            # 指数退避算法
+            wait = 2 ** attempt
+            console.print(
+                f"[bold yellow]⟳ HTTP {e.status_code}，{wait}s 后重试 "
+                f"({attempt + 1}/{MAX_RETRIES})...[/]"
+            )
+            await asyncio.sleep(wait)
+
+        except ModelAPIError:
+            # dns 等网络不通的错误，自动重试
+            if attempt >= MAX_RETRIES:
+                console.print(f"[bold red]✗ 网络连接失败，重试 {MAX_RETRIES} 次后仍无法连接[/]")
+                raise
+
+            # 指数退避算法
+            wait = 2 ** attempt
+            console.print(
+                f"[bold yellow]⟳ 网络连接失败，{wait}s 后重试 "
+                f"({attempt + 1}/{MAX_RETRIES})...[/]"
+            )
+            await asyncio.sleep(wait)
+
+@hooks.on.tool_execute_error
+async def _handle_tool_error(ctx, *, call, tool_def, args, error):
+    console.print(f"[bold red]✗ 工具 {call.tool_name} 出错：{error}[/]")
+    return f"工具执行出错：{type(error).__name__}: {error}"

@@ -52,6 +52,9 @@ class PermissionState:
 
 
 state = PermissionState()
+# state = PermissionState()（permissions.py:54）的意思是：造一个实例，并把它绑定到模块级变量 state
+# 函数里的 state 是模块全局变量，指向那个唯一实例。
+# state.mode = ... 是给这个实例的属性重新赋值，不是创建新对象，也不是局部变量。
 
 
 def compute_decision(tool_name: str, args: dict) -> str:
@@ -84,8 +87,10 @@ def cycle_mode() -> str:
     按 default -> acceptEdits -> bypass -> default 循环切换。
     """
     index = MODES.index(state.mode)
+    # state.mode = ... 是给这个实例的属性重新赋值，不是创建新对象，也不是局部变量。
     state.mode = MODES[(index + 1) % len(MODES)]
     return state.mode
+
 
 
 # 可能装着整份文件内容的参数，预览里只留开头；命令、路径等参数完整展示

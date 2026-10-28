@@ -7,6 +7,7 @@ from rich.markup import escape
 from rich.padding import Padding
 from rich.rule import Rule
 
+import permissions
 import session
 from .render import console, print_step, print_welcome_banner
 
@@ -221,6 +222,7 @@ def cmd_resume(state: SessionState) -> bool:
 
 def cmd_status(state: SessionState) -> bool:
     console.print(f"模型：           {state.model_name}")
+    console.print(f"权限模式：       {permissions.state.mode}")
     console.print(f"历史消息条数：    {len(state.history)}")
     console.print(f"累计输入 tokens：{state.input_tokens}")
     console.print(f"累计输出 tokens：{state.output_tokens}\n")

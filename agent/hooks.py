@@ -11,6 +11,7 @@ from typing import Any
 from pydantic_ai.capabilities import Hooks
 from pydantic_ai.exceptions import ModelHTTPError, ModelAPIError
 
+import permissions
 from ui.render import console
 
 
@@ -114,8 +115,39 @@ async def _retry_on_error(ctx, *, request_context, handler):
                 f"({attempt + 1}/{MAX_RETRIES})...[/]"
             )
             await asyncio.sleep(wait)
+# ---------- 工具调用权限检查 ----------
+
+@hooks.on.tool_execute
+async def _check_permission(ctx, *, call, tool_def, args, handler):
+    """
+    工具执行前的权限关卡。allow 就调用 handler 真正执行；
+    ask 就弹审批列表；deny 则把拒绝原因当作工具结果回填，让模型自行纠正。
+    """
+    decision = permissions.compute_decision(call.tool_name, args)
+    if decision == "allow":
+        # 放行，handler(args) 才是真正执行工具的那一步
+        return await handler(args)
+
+    # decision == "ask"，弹审批让用户决定
+    choice = await permissions.prompt_approval(call.tool_name, args)
+    if choice == "once":
+        return await handler(args)
+    if choice == "always":
+        # 记进会话白名单，本会话内这个工具不再询问
+        permissions.state.session_allowed.add(call.tool_name)
+        return await handler(args)
+
+    # 拒绝：不执行工具，把拒绝原因回填给模型，让它停下来等用户发话，而不是自作主张绕过去
+    return f"用户拒绝了对 {call.tool_name} 的调用，这次调用没有执行。请停下手上的事，等用户告诉你接下来该怎么做。"
+
+
+# ---------- 工具执行异常兜底 ----------
 
 @hooks.on.tool_execute_error
 async def _handle_tool_error(ctx, *, call, tool_def, args, error):
+    """
+        工具函数抛出未捕获异常时，不让进程崩溃，
+        而是把错误信息作为 tool result 返回给模型，让它自行纠正。
+        """
     console.print(f"[bold red]✗ 工具 {call.tool_name} 出错：{error}[/]")
     return f"工具执行出错：{type(error).__name__}: {error}"

@@ -51,11 +51,11 @@ def apply_result(state, result):
 
 async def run_agent_loop(user_input, state):
     """
-    展开 agent.run_sync()，逐节点驱动 Agent 循环，每步实时打印。
+    用 agent.iter() 逐节点驱动 Agent 循环，每步实时打印。
     """
     api_call_log.clear()
 
-    async with agent.iter(user_input, message_history=state.history) as run:
+    async with agent.iter(user_input, message_history=state.history, deps=state.read_file_state) as run:
         node = run.next_node
 
         while not isinstance(node, End):

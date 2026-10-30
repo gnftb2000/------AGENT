@@ -1,14 +1,16 @@
+import difflib
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import questionary
+from prompt_toolkit.application import in_terminal
 from rich.markdown import Heading, Markdown
 from rich.markup import escape
 from rich.padding import Padding
-from rich.rule import Rule
 
 import permissions
 import session
+from agent import ReadFileState
 from .render import console, print_step, print_welcome_banner
 
 
@@ -39,6 +41,8 @@ class SessionState:
     session_id: str = ""
     # 最近一轮 user input 触发的所有 model API 调用记录
     last_api_calls: list = field(default_factory=list)
+    # 本会话的 readFileState，注入给文件工具；切换会话时换上新实例
+    read_file_state: ReadFileState = field(default_factory=ReadFileState)
 
 
 @dataclass
@@ -47,13 +51,6 @@ class Command:
     description: str
     # handler 返回 False 表示主循环应当退出
     handler: Callable[["SessionState"], bool]
-
-
-def print_divider() -> None:
-    """
-    每轮交互之前打印一条分割线，区分输入区域。Rule 会自适应终端宽度。
-    """
-    console.print(Rule(style="grey50"))
 
 
 def _truncate(text, limit: int = 120) -> str:
@@ -94,9 +91,10 @@ def _format_part_line(part) -> Optional[str]:
         # 命令、路径动辄上百字符，参数放宽到 500 字符再截断
         return f"[yellow]⏺ tool_call[/]\n  [yellow dim]{part.tool_name}({_truncate(part.args, 500)})[/]"
     if kind == "tool-return":
+        # 工具成功返回，标签用 ✔
         return f"[magenta]✔ tool_return[/]\n  [magenta dim]{part.tool_name} -> {_truncate(part.content)}[/]"
     if kind == "retry-prompt":
-        # 工具抛 ModelRetry 后，SDK 生成 retry-prompt 把错误反馈给模型
+        # 工具抛 ModelRetry 后，SDK 生成 retry-prompt 把错误反馈给模型，标签用 ✘ 表示这次调用失败
         return f"[yellow]✘ tool_retry[/]\n  [yellow dim]{part.tool_name} -> {_truncate(part.content)}[/]"
     return None
 
@@ -110,9 +108,77 @@ def print_assistant_markdown(content: str) -> None:
     console.print(Padding(Markdown(content), (0, 0, 0, 2)))
 
 
+# read / write 内容预览最多显示的行数，超出的折叠成「… +N 行」
+_PREVIEW_MAX_LINES = 8
+
+
+def _preview_numbered(content: str) -> Optional[str]:
+    """
+    把内容加绿色行号、截断成预览，用于 write_file 的写入内容展示。
+    """
+    lines = content.splitlines()
+    if not lines:
+        return None
+    width = len(str(len(lines)))
+    shown = lines[:_PREVIEW_MAX_LINES]
+    out = [f"  [green]{i:>{width}}[/] {escape(ln)}" for i, ln in enumerate(shown, 1)]
+    if len(lines) > _PREVIEW_MAX_LINES:
+        out.append(f"  [dim]… +{len(lines) - _PREVIEW_MAX_LINES} 行[/]")
+    return "\n".join(out)
+
+
+def _preview_diff(old: str, new: str) -> str:
+    """
+    用 difflib 把 old -> new 渲染成红绿 diff：删除行红、新增行绿、不变行 dim。
+    """
+    out = []
+    for line in difflib.ndiff(old.splitlines(), new.splitlines()):
+        tag, body = line[:2], escape(line[2:])
+        if tag == "- ":
+            out.append(f"  [red]- {body}[/]")
+        elif tag == "+ ":
+            out.append(f"  [green]+ {body}[/]")
+        elif tag == "  ":
+            out.append(f"  [dim]  {body}[/]")
+        # "? " 是 difflib 的字符级提示行，跳过不显示
+    return "\n".join(out)
+
+
+def _print_file_op(part) -> bool:
+    """
+    文件工具的富展示：edit 红绿 diff、write 带行号写入预览、read 带行号读取结果。返回 True 表示已处理。
+    """
+    # 这里按工具名特判，没像 permissions 那样建注册表：展示逻辑依赖 rich，若让工具层注册渲染器，agent 层就会反向依赖 UI 层，得不偿失
+    kind = part.part_kind
+    if kind == "tool-call" and part.tool_name in ("edit_file", "write_file"):
+        args = part.args_as_dict()
+        path = escape(str(args.get("path", "")))
+        # edit / write 的标签行与「工具名(路径)」内容行格式一致，统一打印，只有下方的预览不同
+        console.print("[yellow]⏺ tool_call[/]")
+        console.print(Padding(f"[yellow dim]{part.tool_name}({path})[/]", (0, 0, 0, 2)))
+        if part.tool_name == "edit_file":
+            console.print(_preview_diff(args.get("old_string", ""), args.get("new_string", "")))
+        else:
+            block = _preview_numbered(args.get("content", ""))
+            if block:
+                console.print(block)
+        return True
+    if kind == "tool-return" and part.tool_name == "read_file":
+        # read_file 的返回已经是带行号的内容，按行截断预览
+        console.print("[magenta]✔ tool_return[/]")
+        console.print(Padding("[magenta dim]read_file[/]", (0, 0, 0, 2)))
+        lines = str(part.content).splitlines()
+        for ln in lines[:_PREVIEW_MAX_LINES]:
+            console.print(f"  [dim]{escape(ln)}[/]")
+        if len(lines) > _PREVIEW_MAX_LINES:
+            console.print(f"  [dim]… +{len(lines) - _PREVIEW_MAX_LINES} 行[/]")
+        return True
+    return False
+
+
 def print_part(part) -> None:
     """
-    渲染单个消息 part：assistant 文本走 Markdown 块渲染，其余 part 是单行文本。
+    渲染单个消息 part：assistant 文本走 Markdown，文件操作走富展示，其余 part 是单行文本。
     """
     if part.part_kind == "text":
         content = (part.content or "").strip()
@@ -120,6 +186,10 @@ def print_part(part) -> None:
             print_assistant_markdown(content)
             # 每个 role block 末尾留一个空行，块与块之间不那么挤
             console.print()
+        return
+    # 文件工具（read / edit / write）走专门的富展示
+    if _print_file_op(part):
+        console.print()
         return
     line = _format_part_line(part)
     if line:
@@ -162,6 +232,10 @@ def cmd_new(state: SessionState) -> bool:
     state.output_tokens = 0
     state.last_api_calls.clear()
     state.session_id = session.new_session_id()
+    # 权限白名单是会话级的，「本会话不再询问」不该带进新会话
+    permissions.state.session_allowed.clear()
+    # readFileState 也是会话级的，新会话从空白开始，旧会话读过的文件不带进来
+    state.read_file_state = ReadFileState()
     console.print("已开启新会话\n")
     return True
 
@@ -176,9 +250,10 @@ def _summary_line(mtime, prompt: str) -> str:
     return f"{mtime:%m-%d %H:%M}  {prompt}"
 
 
-def cmd_resume(state: SessionState) -> bool:
+async def cmd_resume(state: SessionState) -> bool:
     """
     列出当前项目的历史会话，选中后恢复对话历史。
+    它跑在 REPL 的事件循环里，所以是异步的：in_terminal 把终端让给 questionary，结束后再恢复输入框。
     """
     sessions = session.list_sessions()
     if not sessions:
@@ -189,9 +264,10 @@ def cmd_resume(state: SessionState) -> bool:
         questionary.Choice(title=_summary_line(mtime, prompt), value=sid)
         for sid, mtime, prompt in sessions
     ]
-    selected = questionary.select(
-        "选择要恢复的会话（上下键移动，回车确认）：", choices=choices
-    ).ask()
+    async with in_terminal():
+        selected = await questionary.select(
+            "选择要恢复的会话（上下键移动，回车确认）：", choices=choices
+        ).ask_async()
     # 用户按 Ctrl+C 取消选择
     if selected is None:
         return True
@@ -199,6 +275,10 @@ def cmd_resume(state: SessionState) -> bool:
     # 还原对话历史，并把会话 ID 切换成选中的旧会话，后续消息继续追加到同一个文件
     state.history = session.load_history(selected)
     state.session_id = selected
+    # 权限白名单是会话级的，切换会话后清空
+    permissions.state.session_allowed.clear()
+    # readFileState 也是会话级的，切换会话后换上新实例。恢复的历史里虽有读取痕迹，但进程退出后文件可能已变、mtime 不再可信，让模型恢复后首次编辑重读一次更稳
+    state.read_file_state = ReadFileState()
 
     # jsonl 里每条模型回复都带 usage，把会话的 token 用量累加回来
     state.input_tokens = sum(

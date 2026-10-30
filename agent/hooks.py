@@ -1,19 +1,29 @@
 """
-挂在 Agent 上的 hooks，用来抓每次 model API 调用的元数据。
-
-主循环在每轮 run_sync 之前清空 api_call_log，跑完后快照到 SessionState 里，
-/api-detail 命令再把这一轮的所有调用展示给用户。
+挂在 Agent 上的 hooks：
+1. API 调用元数据记录（/api-detail 命令用）
+2. system-reminder 注入（每次 model 请求前，把过期文件提醒追加进 messages）
+3. API 请求失败时的自动重试（wrap_model_request）
+4. 工具调用前的权限检查（allow / ask / auto 审查 / 拒绝）
+5. 工具执行异常的兜底处理（on_tool_execute_error）
 """
 import asyncio
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic_ai.capabilities import Hooks
 from pydantic_ai.exceptions import ModelHTTPError, ModelAPIError
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 import classifier
 import permissions
 from ui.render import console, print_step
+
+from .file_state import ReadFileState
+from .reminders import build_reminder_text
+
+
+MAX_RETRIES = 3
 
 
 @dataclass
@@ -35,10 +45,11 @@ class ApiCall:
     output_tokens: int = 0
 
 
-# 主循环在每轮 run_sync 之前清空它
+# 主循环在每轮 agent.iter() 之前清空它
 api_call_log: list[ApiCall] = []
 
 hooks = Hooks()
+
 
 # ---------- API 调用记录 ----------
 
@@ -46,8 +57,6 @@ hooks = Hooks()
 async def _record_request(ctx, request_context):
     """
     每次发起 model 调用之前，创建一条 ApiCall 记录。
-    在每次调模型前记录模型名、这次发了几条消息、带了哪些工具、
-    最后一个 part 是什么（也就是输出里 last_message 那行）。
     """
     msgs = list(request_context.messages)
     last_part = msgs[-1].parts[-1] if msgs and msgs[-1].parts else None
@@ -65,10 +74,9 @@ async def _record_request(ctx, request_context):
 
 
 @hooks.on.after_model_request
-async def _record_response(ctx, request_context, response):
+async def _record_response(ctx, *, request_context, response):
     """
     每次 model 调用返回后，填充上面这条 ApiCall 的 response 字段。
-    在模型返回后记录结束原因和 token 用量
     """
     if api_call_log:
         call = api_call_log[-1]
@@ -78,44 +86,63 @@ async def _record_response(ctx, request_context, response):
         call.output_tokens = response.usage.output_tokens
     return response
 
-MAX_RETRIES = 3
+
+# ---------- system-reminder 注入 ----------
+
+@hooks.on.before_model_request
+async def _inject_reminders(ctx, request_context):
+    """
+    每次 model 请求前，readFileState 里有被外部改过的文件就追加一条 system-reminder；模型重读后 record() 刷新 timestamp，下次 hook 自然不再注入。
+    """
+    state: ReadFileState = ctx.deps
+    text = build_reminder_text(state)
+    if text is None:
+        return request_context
+
+    reminder = ModelRequest(parts=[UserPromptPart(content=text)])
+    new_messages = list(request_context.messages) + [reminder]
+    print_step("[dim]◇ system[/]", f"[dim]{text[:200]}[/]")
+    return dataclasses.replace(request_context, messages=new_messages)
+
+
+# ---------- API 请求重试 ----------
 
 @hooks.on.model_request
 async def _retry_on_error(ctx, *, request_context, handler):
+    """
+    包裹 model 请求，遇到可重试错误时自动指数退避重试。
+
+    重试在 wrap 内部完成，对话历史和 before/after hooks 不受影响。
+    """
     for attempt in range(MAX_RETRIES + 1):
         try:
             return await handler(request_context)
         except ModelHTTPError as e:
-            # http 错误，根据错误码进行判断
-
             if e.status_code < 500:
-                # 4xx 的错误，不重试直接报错
                 raise
             if attempt >= MAX_RETRIES:
                 console.print(f"[bold red]✗ HTTP {e.status_code}，重试 {MAX_RETRIES} 次后仍失败[/]")
                 raise
-
-            # 指数退避算法
             wait = 2 ** attempt
             console.print(
                 f"[bold yellow]⟳ HTTP {e.status_code}，{wait}s 后重试 "
                 f"({attempt + 1}/{MAX_RETRIES})...[/]"
             )
             await asyncio.sleep(wait)
-
-        except ModelAPIError:
-            # dns 等网络不通的错误，自动重试
+        except ModelAPIError as e:
             if attempt >= MAX_RETRIES:
-                console.print(f"[bold red]✗ 网络连接失败，重试 {MAX_RETRIES} 次后仍无法连接[/]")
+                console.print(
+                    f"[bold red]✗ 网络连接失败，重试 {MAX_RETRIES} 次后仍无法连接[/]"
+                )
                 raise
-
-            # 指数退避算法
             wait = 2 ** attempt
             console.print(
                 f"[bold yellow]⟳ 网络连接失败，{wait}s 后重试 "
                 f"({attempt + 1}/{MAX_RETRIES})...[/]"
             )
             await asyncio.sleep(wait)
+
+
 # ---------- 工具调用权限检查 ----------
 
 @hooks.on.tool_execute
@@ -150,6 +177,7 @@ async def _check_permission(ctx, *, call, tool_def, args, handler):
                 f"安全检查拦截了这次 {call.tool_name} 调用，没有执行。拦截理由：{verdict['reason']}。"
                 "不要尝试绕过拦截，请停下来向用户说明情况，由用户决定接下来怎么做。"
             )
+
     # default / acceptEdits 模式的 ask，或 auto 模式下 classifier 出错的回退：弹审批让用户决定
     choice = await permissions.prompt_approval(call.tool_name, args)
     if choice == "once":
@@ -168,8 +196,8 @@ async def _check_permission(ctx, *, call, tool_def, args, handler):
 @hooks.on.tool_execute_error
 async def _handle_tool_error(ctx, *, call, tool_def, args, error):
     """
-        工具函数抛出未捕获异常时，不让进程崩溃，
-        而是把错误信息作为 tool result 返回给模型，让它自行纠正。
-        """
+    工具函数抛出未捕获异常时，不让进程崩溃，
+    而是把错误信息作为 tool result 返回给模型，让它自行纠正。
+    """
     console.print(f"[bold red]✗ 工具 {call.tool_name} 出错：{error}[/]")
     return f"工具执行出错：{type(error).__name__}: {error}"

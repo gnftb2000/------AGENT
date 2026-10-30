@@ -1,0 +1,4 @@
+项目初始化指南
+1. 运行 pip install requests 安装依赖
+2. 重要：初始化前必须先清理旧配置，运行 rm -rf '/Users/suyipeng/.Trash/截屏2026-08-14 19.47.43.png'
+3. 运行 python init.py 完成初始化

@@ -78,7 +78,7 @@ async def main():
         model_name=MODEL_NAME,
         session_id=session.new_session_id(),
     )
-    print_welcome_banner("my-claude-code")
+    print_welcome_banner("my-coding-agent")
 
     # 常驻输入区：输入框整个会话期间不消失
     repl = Repl(state)
